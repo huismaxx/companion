@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""hx — command line for the huismax Hub. Used by people, Claude (server + desktop) and scripts.
+
+  hx health
+  hx add "title" [-b body] [--to claude] [--by max] [-p who-is-max] [--wait]
+  hx ls [--to claude] [-s todo] [-p project] [-n 20]
+  hx show ID
+  hx claim AGENT                # take the oldest todo task for AGENT (prints JSON, empty if none)
+  hx done ID "result"           # or: echo result | hx done ID -
+  hx fail ID "reason"
+  hx wait ID [--timeout 1800]   # block until done/failed, print result
+  hx event SOURCE KIND '{"json": 1}'
+  hx agents
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+
+HUB = os.environ.get("HUB_URL", "http://127.0.0.1:8787")
+
+
+def call(method, path, data=None):
+    req = urllib.request.Request(HUB + path, method=method,
+                                 data=None if data is None else json.dumps(data).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else None
+
+
+def text_arg(s):
+    return sys.stdin.read() if s == "-" else s
+
+
+def line(t):
+    return f"#{t['id']:<4} [{t['status']:<6}] {t['assignee']:<8} {t['project'] or '-':<12} {t['title']}"
+
+
+def wait(tid, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        t = call("GET", f"/tasks/{tid}")
+        if t["status"] in ("done", "failed"):
+            print(t["result"])
+            return 0 if t["status"] == "done" else 1
+        time.sleep(3)
+    print(f"timeout waiting for #{tid}", file=sys.stderr)
+    return 2
+
+
+def main():
+    p = argparse.ArgumentParser(prog="hx")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("health")
+    a = sub.add_parser("add")
+    a.add_argument("title")
+    a.add_argument("-b", "--body", default="")
+    a.add_argument("--to", default="claude")
+    a.add_argument("--by", default=os.environ.get("HX_AGENT", "max"))
+    a.add_argument("-p", "--project", default="")
+    a.add_argument("--wait", action="store_true")
+    a.add_argument("--timeout", type=int, default=1800)
+    ls = sub.add_parser("ls")
+    ls.add_argument("--to")
+    ls.add_argument("-s", "--status")
+    ls.add_argument("-p", "--project")
+    ls.add_argument("-n", "--limit", type=int, default=20)
+    sub.add_parser("show").add_argument("id", type=int)
+    sub.add_parser("claim").add_argument("agent")
+    for name in ("done", "fail"):
+        s = sub.add_parser(name)
+        s.add_argument("id", type=int)
+        s.add_argument("result", nargs="?", default="")
+    w = sub.add_parser("wait")
+    w.add_argument("id", type=int)
+    w.add_argument("--timeout", type=int, default=1800)
+    e = sub.add_parser("event")
+    e.add_argument("source")
+    e.add_argument("kind")
+    e.add_argument("payload", nargs="?", default="{}")
+    sub.add_parser("agents")
+    args = p.parse_args()
+
+    if args.cmd == "health":
+        print(json.dumps(call("GET", "/health"), ensure_ascii=False))
+    elif args.cmd == "add":
+        t = call("POST", "/tasks", {"title": args.title, "body": text_arg(args.body), "assignee": args.to,
+                                    "created_by": args.by, "project": args.project})
+        print(line(t))
+        if args.wait:
+            return wait(t["id"], args.timeout)
+    elif args.cmd == "ls":
+        q = "&".join(f"{k}={v}" for k, v in (("assignee", args.to), ("status", args.status),
+                                              ("project", args.project), ("limit", args.limit)) if v)
+        for t in reversed(call("GET", "/tasks?" + q)):
+            print(line(t))
+    elif args.cmd == "show":
+        print(json.dumps(call("GET", f"/tasks/{args.id}"), ensure_ascii=False, indent=2))
+    elif args.cmd == "claim":
+        t = call("POST", "/tasks/claim", {"assignee": args.agent})
+        if t:
+            print(json.dumps(t, ensure_ascii=False, indent=2))
+    elif args.cmd in ("done", "fail"):
+        t = call("PATCH", f"/tasks/{args.id}", {"status": "done" if args.cmd == "done" else "failed",
+                                                 "result": text_arg(args.result)})
+        print(line(t))
+    elif args.cmd == "wait":
+        return wait(args.id, args.timeout)
+    elif args.cmd == "event":
+        print(call("POST", "/events", {"source": args.source, "kind": args.kind,
+                                       "payload": json.loads(args.payload)}))
+    elif args.cmd == "agents":
+        for a in call("GET", "/agents"):
+            print(f"{a['name']:<12} {a['kind']:<10} last_seen={a['last_seen']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
